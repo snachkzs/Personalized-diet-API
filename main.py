@@ -1,8 +1,39 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from jose import JWTError, jwt
+import bcrypt
+
+# JWT Configuration
+
+SECRET_KEY = "123456"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 app = FastAPI(title="Personalized Diet Planning API")
+
+class User(BaseModel):
+    username: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    disabled: Optional[bool] = None
+
+class UserInDB(User):
+    hashed_password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
 
 class NutritionalGoal(BaseModel):
     calories: int
@@ -54,6 +85,69 @@ class ProductionBatch(BaseModel):
     productionDate: str
     dietPlans: List[int] = []
     recipeBatches: List[RecipeBatch] = []
+
+users_db = {
+    "admin": {
+        "username": "admin",
+        "full_name": "Admin User",
+        "email": "admin@example.com",
+        "hashed_password": "$2b$12$aMsaZy7eBOlqKWcAu/MfaObxmG3Lrw0eQVJjYlYDHA4SSwXGZ8S86",  # password: secret
+        "disabled": False,
+    }
+}
+
+def verify_password(plain_password, hashed_password):
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def get_password_hash(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def get_user(username: str):
+    if username in users_db:
+        user_dict = users_db[username]
+        return UserInDB(**user_dict)
+    return None
+
+def authenticate_user(username: str, password: str):
+    user = get_user(username)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    if current_user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
 
 customers = [
     {
@@ -139,21 +233,61 @@ next_recipe_id = 4
 next_diet_plan_id = 2
 next_production_batch_id = 2
 
+
+
+@app.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
+async def register(user: UserRegister):
+    if user.username in users_db:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    hashed_password = get_password_hash(user.password)
+    user_dict = {
+        "username": user.username,
+        "email": user.email,
+        "full_name": user.full_name,
+        "hashed_password": hashed_password,
+        "disabled": False,
+    }
+    users_db[user.username] = user_dict
+    return User(**user_dict)
+
+@app.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/users/me", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
 # ===================== CUSTOMER ENDPOINTS =====================
 
 @app.get('/customers')
-def get_customers():
+def get_customers(current_user: User = Depends(get_current_active_user)):
     return customers
 
 @app.get('/customers/{customer_id}')
-def get_customer_by_id(customer_id: int):
+def get_customer_by_id(customer_id: int, current_user: User = Depends(get_current_active_user)):
     customer = next((c for c in customers if c['id'] == customer_id), None)
     if customer:
         return customer
     raise HTTPException(status_code=404, detail='Customer not found')
 
 @app.post('/customers', status_code=201)
-def add_customer(customer: Customer):
+def add_customer(customer: Customer, current_user: User = Depends(get_current_active_user)):
     global next_customer_id
     
     new_customer = {
@@ -169,7 +303,7 @@ def add_customer(customer: Customer):
     return new_customer
 
 @app.put('/customers/{customer_id}')
-def update_customer(customer_id: int, customer: Customer):
+def update_customer(customer_id: int, customer: Customer, current_user: User = Depends(get_current_active_user)):
     existing_customer = next((c for c in customers if c['id'] == customer_id), None)
     if not existing_customer:
         raise HTTPException(status_code=404, detail='Customer not found')
@@ -184,7 +318,7 @@ def update_customer(customer_id: int, customer: Customer):
     return existing_customer
 
 @app.delete('/customers/{customer_id}')
-def delete_customer(customer_id: int):
+def delete_customer(customer_id: int, current_user: User = Depends(get_current_active_user)):
     global customers
     customer = next((c for c in customers if c['id'] == customer_id), None)
     if not customer:
@@ -196,18 +330,18 @@ def delete_customer(customer_id: int):
 # ===================== RECIPE ENDPOINTS =====================
 
 @app.get('/recipes')
-def get_recipes():
+def get_recipes(current_user: User = Depends(get_current_active_user)):
     return recipes
 
 @app.get('/recipes/{recipe_id}')
-def get_recipe_by_id(recipe_id: int):
+def get_recipe_by_id(recipe_id: int, current_user: User = Depends(get_current_active_user)):
     recipe = next((r for r in recipes if r['id'] == recipe_id), None)
     if recipe:
         return recipe
     raise HTTPException(status_code=404, detail='Recipe not found')
 
 @app.post('/recipes', status_code=201)
-def add_recipe(recipe: Recipe):
+def add_recipe(recipe: Recipe, current_user: User = Depends(get_current_active_user)):
     global next_recipe_id
     
     new_recipe = {
@@ -221,7 +355,7 @@ def add_recipe(recipe: Recipe):
     return new_recipe
 
 @app.put('/recipes/{recipe_id}')
-def update_recipe(recipe_id: int, recipe: Recipe):
+def update_recipe(recipe_id: int, recipe: Recipe, current_user: User = Depends(get_current_active_user)):
     existing_recipe = next((r for r in recipes if r['id'] == recipe_id), None)
     if not existing_recipe:
         raise HTTPException(status_code=404, detail='Recipe not found')
@@ -234,7 +368,7 @@ def update_recipe(recipe_id: int, recipe: Recipe):
     return existing_recipe
 
 @app.delete('/recipes/{recipe_id}')
-def delete_recipe(recipe_id: int):
+def delete_recipe(recipe_id: int, current_user: User = Depends(get_current_active_user)):
     global recipes
     recipe = next((r for r in recipes if r['id'] == recipe_id), None)
     if not recipe:
@@ -246,21 +380,21 @@ def delete_recipe(recipe_id: int):
 # ===================== DIET PLAN ENDPOINTS =====================
 
 @app.get('/diet-plans')
-def get_diet_plans(customerId: Optional[int] = Query(None)):
+def get_diet_plans(customerId: Optional[int] = Query(None), current_user: User = Depends(get_current_active_user)):
     if customerId:
         filtered = [dp for dp in diet_plans if dp['customerId'] == customerId]
         return filtered
     return diet_plans
 
 @app.get('/diet-plans/{plan_id}')
-def get_diet_plan_by_id(plan_id: int):
+def get_diet_plan_by_id(plan_id: int, current_user: User = Depends(get_current_active_user)):
     plan = next((dp for dp in diet_plans if dp['id'] == plan_id), None)
     if plan:
         return plan
     raise HTTPException(status_code=404, detail='Diet plan not found')
 
 @app.post('/diet-plans', status_code=201)
-def create_diet_plan(diet_plan: DietPlan):
+def create_diet_plan(diet_plan: DietPlan, current_user: User = Depends(get_current_active_user)):
     global next_diet_plan_id
     
     customer = next((c for c in customers if c['id'] == diet_plan.customerId), None)
@@ -278,7 +412,7 @@ def create_diet_plan(diet_plan: DietPlan):
     return new_plan
 
 @app.post('/diet-plans/{plan_id}/validate')
-def validate_diet_plan(plan_id: int):
+def validate_diet_plan(plan_id: int, current_user: User = Depends(get_current_active_user)):
     """BC1: Validate DietPlan against Customer's NutritionalGoal and DietaryRestriction"""
     plan = next((dp for dp in diet_plans if dp['id'] == plan_id), None)
     if not plan:
@@ -314,7 +448,7 @@ def validate_diet_plan(plan_id: int):
     return validation_result
 
 @app.put('/diet-plans/{plan_id}')
-def update_diet_plan(plan_id: int, diet_plan: DietPlan):
+def update_diet_plan(plan_id: int, diet_plan: DietPlan, current_user: User = Depends(get_current_active_user)):
     plan = next((dp for dp in diet_plans if dp['id'] == plan_id), None)
     if not plan:
         raise HTTPException(status_code=404, detail='Diet plan not found')
@@ -326,7 +460,7 @@ def update_diet_plan(plan_id: int, diet_plan: DietPlan):
     return plan
 
 @app.delete('/diet-plans/{plan_id}')
-def delete_diet_plan(plan_id: int):
+def delete_diet_plan(plan_id: int, current_user: User = Depends(get_current_active_user)):
     global diet_plans
     plan = next((dp for dp in diet_plans if dp['id'] == plan_id), None)
     if not plan:
@@ -338,19 +472,18 @@ def delete_diet_plan(plan_id: int):
 # ===================== PRODUCTION BATCH ENDPOINTS =====================
 
 @app.get('/production-batches')
-def get_production_batches():
+def get_production_batches(current_user: User = Depends(get_current_active_user)):
     return production_batches
 
 @app.get('/production-batches/{batch_id}')
-def get_production_batch_by_id(batch_id: int):
+def get_production_batch_by_id(batch_id: int, current_user: User = Depends(get_current_active_user)):
     batch = next((pb for pb in production_batches if pb['id'] == batch_id), None)
     if batch:
         return batch
     raise HTTPException(status_code=404, detail='Production batch not found')
 
 @app.post('/production-batches', status_code=201)
-def create_production_batch(batch: ProductionBatch):
-    """BC4: Daily Production Fulfillment - Create production batch from validated diet plans"""
+def create_production_batch(batch: ProductionBatch, current_user: User = Depends(get_current_active_user)):
     global next_production_batch_id
     
     new_batch = {
