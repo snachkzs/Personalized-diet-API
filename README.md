@@ -9,7 +9,7 @@ cd Personalized-diet-API
 
 2. Install dependencies:
 ```bash
-pip install fastapi uvicorn pydantic
+pip install fastapi uvicorn pydantic python-jose passlib bcrypt python-multipart
 ```
 
 3. Run server:
