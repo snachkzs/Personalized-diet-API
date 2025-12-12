@@ -2,19 +2,21 @@ from fastapi import FastAPI, HTTPException, Query, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from jose import JWTError, jwt
-import bcrypt
+from passlib.context import CryptContext
 
 # JWT Configuration
-
-SECRET_KEY = "123456"
+SECRET_KEY = "your-secret-key-change-this-in-production"  # Change this to a secure random key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 app = FastAPI(title="Personalized Diet Planning API")
+
+# ===================== AUTH MODELS =====================
 
 class User(BaseModel):
     username: str
@@ -34,6 +36,8 @@ class UserRegister(BaseModel):
     password: str
     email: Optional[str] = None
     full_name: Optional[str] = None
+
+# ===================== DATA MODELS =====================
 
 class NutritionalGoal(BaseModel):
     calories: int
@@ -86,21 +90,24 @@ class ProductionBatch(BaseModel):
     dietPlans: List[int] = []
     recipeBatches: List[RecipeBatch] = []
 
+# ===================== AUTH UTILITIES =====================
+
+# In-memory user database (for demo purposes)
 users_db = {
     "admin": {
         "username": "admin",
         "full_name": "Admin User",
         "email": "admin@example.com",
-        "hashed_password": "$2b$12$aMsaZy7eBOlqKWcAu/MfaObxmG3Lrw0eQVJjYlYDHA4SSwXGZ8S86",  # password: secret
+        "hashed_password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",  # password: secret
         "disabled": False,
     }
 }
 
 def verify_password(plain_password, hashed_password):
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    return pwd_context.hash(password)
 
 def get_user(username: str):
     if username in users_db:
@@ -119,9 +126,9 @@ def authenticate_user(username: str, password: str):
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -148,6 +155,8 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     if current_user.disabled:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
+
+# ===================== DATA STORAGE =====================
 
 customers = [
     {
@@ -233,10 +242,11 @@ next_recipe_id = 4
 next_diet_plan_id = 2
 next_production_batch_id = 2
 
-
+# ===================== AUTH ENDPOINTS =====================
 
 @app.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
 async def register(user: UserRegister):
+    """Register a new user"""
     if user.username in users_db:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -256,6 +266,7 @@ async def register(user: UserRegister):
 
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Login to get access token"""
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -271,6 +282,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.get("/users/me", response_model=User)
 async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    """Get current logged in user info"""
     return current_user
 
 # ===================== CUSTOMER ENDPOINTS =====================
@@ -484,6 +496,7 @@ def get_production_batch_by_id(batch_id: int, current_user: User = Depends(get_c
 
 @app.post('/production-batches', status_code=201)
 def create_production_batch(batch: ProductionBatch, current_user: User = Depends(get_current_active_user)):
+    """BC4: Daily Production Fulfillment - Create production batch from validated diet plans"""
     global next_production_batch_id
     
     new_batch = {
